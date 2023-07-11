@@ -4,6 +4,17 @@ from typing import Any, Callable, List, Optional, Type, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.nn.functional as F
+
+
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
 
 def Conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=dilation, groups=groups, bias=False, dilation=dilation)
@@ -13,7 +24,9 @@ def conv1x1(in_planes: int, out_planes: int, stride: int = 1):
 
 class BasicBlock(nn.Module):
     expansion: int = 1
-    def __init__(self, inplanes: int, planes: int, stride: int = 1, downsample: Optional[nn.Module] = None, base_width: int = 64, dilation: int = 1):
+
+    def __init__(self, inplanes: int, planes: int, stride: int = 1, downsample: Optional[nn.Module] = None,
+                 base_width: int = 64, dilation: int = 1):
         super().__init__()
         self.conv1 = Conv3x3(inplanes, planes, stride)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -42,7 +55,8 @@ class BasicBlock(nn.Module):
 
 class Bottleneck(nn.Module):
     expansion: int = 4
-    def __init__(self, inplanes, planes, stride, downsample: Optional[nn.Module] = None, base_width = 64, dilation = 1):
+
+    def __init__(self, inplanes, planes, stride, downsample: Optional[nn.Module] = None, base_width=64, dilation=1):
         super().__init__()
         width = int(planes * (base_width / 64.0))
         self.conv1 = conv1x1(inplanes, width)
@@ -78,7 +92,14 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
-    def __init__(self, block, layers, num_classes, large_input, width, zero_init_residual=False):
+    def __init__(self,
+                 block,
+                 layers,
+                 num_classes,
+                 large_input,
+                 width,
+                 zero_init_residual=False,
+                 padding_downsample=False):
         super().__init__()
         self.inplanes = width
         self.dilation = 1
@@ -96,18 +117,22 @@ class ResNet(nn.Module):
                 nn.BatchNorm2d(self.inplanes),
                 nn.ReLU(inplace=True)
             )
-        
-        self.layer1 = self._make_layer(block, width, layers[0], stride=1)
-        self.layer2 = self._make_layer(block, width*2, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, width*4, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
-        if len(layers) > 3:            
-            self.layer4 = self._make_layer(block, width*8, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
-            self.fc = nn.Linear(width*8 * block.expansion, num_classes)
+
+        self.layer1 = self._make_layer(block, width, layers[0], stride=1,
+                                       padding_downsample=padding_downsample)
+        self.layer2 = self._make_layer(block, width * 2, layers[1], stride=2, dilate=replace_stride_with_dilation[0],
+                                       padding_downsample=padding_downsample)
+        self.layer3 = self._make_layer(block, width * 4, layers[2], stride=2, dilate=replace_stride_with_dilation[1],
+                                       padding_downsample=padding_downsample)
+        if len(layers) > 3:
+            self.layer4 = self._make_layer(block, width * 8, layers[3], stride=2,
+                                           dilate=replace_stride_with_dilation[2])
+            self.fc = nn.Linear(width * 8 * block.expansion, num_classes)
         else:
             self.layer4 = nn.Identity()
-            self.fc = nn.Linear(width*4 * block.expansion, num_classes)
-        #self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
+            self.fc = nn.Linear(width * 4 * block.expansion, num_classes)
+        # self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
@@ -125,17 +150,21 @@ class ResNet(nn.Module):
                 elif isinstance(m, BasicBlock) and m.bn2.weight is not None:
                     nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
 
-    def _make_layer(self, block, planes, blocks, stride = 1, dilate = False):
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False, padding_downsample=False):
         downsample = None
         previous_dilation = self.dilation
         if dilate:
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
+            if padding_downsample:
+                downsample = LambdaLayer(lambda x: F.pad(x[:, :, ::2, ::2],
+                                                         (0, 0, 0, 0, planes // 4, planes // 4), "constant", 0))
+            else:
+                downsample = nn.Sequential(
+                    conv1x1(self.inplanes, planes * block.expansion, stride),
+                    nn.BatchNorm2d(planes * block.expansion),
+                )
 
         layers = []
         layers.append(
@@ -149,7 +178,7 @@ class ResNet(nn.Module):
                 block(
                     self.inplanes,
                     planes,
-                    stride = 1,
+                    stride=1,
                     base_width=self.base_width,
                     dilation=self.dilation
                 )
@@ -171,35 +200,46 @@ class ResNet(nn.Module):
 
         return x
 
-def resnet18(num_classes, large_input, width):
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes, large_input, width)
 
-def resnet34(num_classes, large_input, width):
-    return ResNet(BasicBlock, [3, 4, 6, 3], num_classes, large_input, width)
+def resnet18(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes, large_input, width, padding_downsample=padding_downsample)
 
-def resnet50(num_classes, large_input, width):
-    return ResNet(Bottleneck, [3, 4, 6, 3], num_classes, large_input, width)
 
-def resnet101(num_classes, large_input, width):
-    return ResNet(Bottleneck, [3, 4, 23, 3], num_classes, large_input, width)
+def resnet34(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [3, 4, 6, 3], num_classes, large_input, width, padding_downsample=padding_downsample)
 
-def resnet152(num_classes, large_input, width):
-    return ResNet(Bottleneck, [3, 8, 36, 3], num_classes, large_input, width)
 
-def resnet20(num_classes, large_input, width):
-    return ResNet(BasicBlock, [3, 3, 3], num_classes, large_input, width)
+def resnet50(num_classes, large_input, width, padding_downsample):
+    return ResNet(Bottleneck, [3, 4, 6, 3], num_classes, large_input, width, padding_downsample=padding_downsample)
 
-def resnet32(num_classes, large_input, width):
-    return ResNet(BasicBlock, [5, 5, 5], num_classes, large_input, width)
 
-def resnet44(num_classes, large_input, width):
-    return ResNet(BasicBlock, [7, 7, 7], num_classes, large_input, width)
+def resnet101(num_classes, large_input, width, padding_downsample):
+    return ResNet(Bottleneck, [3, 4, 23, 3], num_classes, large_input, width, padding_downsample=padding_downsample)
 
-def resnet56(num_classes, large_input, width):
-    return ResNet(BasicBlock, [9, 9, 9], num_classes, large_input, width)
 
-def resnet110(num_classes, large_input, width):
-    return ResNet(BasicBlock, [18, 18, 18], num_classes, large_input, width)
+def resnet152(num_classes, large_input, width, padding_downsample):
+    return ResNet(Bottleneck, [3, 8, 36, 3], num_classes, large_input, width, padding_downsample=padding_downsample)
 
-def resnet1202(num_classes, large_input, width):
-    return ResNet(BasicBlock, [200, 200, 200], num_classes, large_input, width)
+
+def resnet20(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [3, 3, 3], num_classes, large_input, width, padding_downsample=padding_downsample)
+
+
+def resnet32(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [5, 5, 5], num_classes, large_input, width, padding_downsample=padding_downsample)
+
+
+def resnet44(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [7, 7, 7], num_classes, large_input, width, padding_downsample=padding_downsample)
+
+
+def resnet56(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [9, 9, 9], num_classes, large_input, width, padding_downsample=padding_downsample)
+
+
+def resnet110(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [18, 18, 18], num_classes, large_input, width, padding_downsample=padding_downsample)
+
+
+def resnet1202(num_classes, large_input, width, padding_downsample):
+    return ResNet(BasicBlock, [200, 200, 200], num_classes, large_input, width, padding_downsample=padding_downsample)

@@ -1,30 +1,9 @@
-"""Basic script to train CIFAR10 and ImageNet close to SOTA with ResNets"""
-
 """
-CIFAR10
-accelerate launch --mixed_precision fp16 main.py --model $model --cifar-resize $size --batch-size 128 --seed 0
-model     |         32         |         52          |
-resnet20  | 97.97% ( 90% 2h30) | 97.66% (100%  3h38) |
-resnet56  | 98.27% ( 90% 5h22) | 98.40% ( 90%  9h19) |
-resnet18  | 97.77% (100% 2h28) | 98.01% ( 90%  3h11) | 
-resnet50  | 98.17% ( 90% 5h18) | 98.18% ( 90% 10h05) |
-resnet20, width 16, 32x32: 94.65% 
-resnet56, width 16, 32x32: 96.76%
+Basic script to train CIFAR10 and ImageNet close to SOTA with ResNets
 
-CIFAR100
-accelerate launch --mixed_precision fp16 main.py --model $model --dataset cifar100 --cifar-resize $size --batch-size 128 --seed 0
-model     |         32         |         52          |
-resnet20  | 83.69% ( 90% 2h32) | 83.88% ( 70% 3h42)  | 
-resnet56  | 85.64% ( 70% 5h27) | 85.96% ( 70% 9h19)  |
-resnet18  | 82.96% ( 70% 2h16) | 84.89% ( 80% 3h11)  |
-resnet50  | 84.81% ( 60% 5h39) | 85.20% ( 60% 10h08) |
-resnet20, width 16, 32x32: 71.83%
-resnet56, width 16, 32x32: 79.18%
-
-ImageNet
-accelerate launch --gpu_ids 0,1,2,3 --multi_gpu --num_processes 4 --mixed_precision fp16 main.py --model resnet18 --dataset imagenet --seed 0 : 
-accelerate launch --gpu_ids 0,1,2,3 --multi_gpu --num_processes 4 --mixed_precision fp16 main.py --model resnet50 --dataset imagenet --seed 0 : 80.77% (90% 29h24)
-(Peak perf is  80.65% at step 716885 ( 80.83% at step 671288))
+CIFAR10, with padding
+accelerate launch --mixed_precision fp16 main.py --model $model --cifar-resize $size --batch-size 128 --seed 0 --padding-downsample
+resnet56, width 16, 32x32: 96.78%
 """
 
 import torch
@@ -50,8 +29,8 @@ accelerator = Accelerator(split_batches=True)
 parser = argparse.ArgumentParser(description="Vincent's Training Routine")
 parser.add_argument('--dataset', type=str, default="CIFAR10", help="CIFAR10, CIFAR100 or ImageNet")
 parser.add_argument('--steps', type=int, default=750000)
-parser.add_argument('--batch-size', type = int, default=1024)
-parser.add_argument('--seed', type = int, default=-1)
+parser.add_argument('--batch-size', type=int, default=1024)
+parser.add_argument('--seed', type=int, default=-1)
 parser.add_argument('--model', type=str, default="resnet50")
 parser.add_argument('--width', type=int, default=64, help="number of feature maps for first layers")
 parser.add_argument('--dataset-path', type=str, default=os.getenv("DATASETS"))
@@ -68,6 +47,8 @@ parser.add_argument('--save-model', type=str, default="")
 parser.add_argument('--load-model', type=str, default="")
 parser.add_argument('--test-only', action="store_true")
 parser.add_argument('--no-warmup', action="store_true")
+parser.add_argument('--padding-downsample', action="store_true")
+
 args = parser.parse_args()
 args.steps = 10 * (args.steps // 10)
 if args.weight_decay < 0:
@@ -157,7 +138,7 @@ test_loader = torch.utils.data.DataLoader(
     persistent_workers=True)
 
 # Prepare model, EMA and parameter sets
-net = eval(args.model)(num_classes, large_input, args.width)
+net = eval(args.model)(num_classes, large_input, args.width, padding_downsample=args.padding_downsample)
 
 new_size = False
 if args.load_model != "":
@@ -282,7 +263,7 @@ for era in range(1 if args.adam or args.no_warmup else 0, args.eras + 1):
 
     if start_time == 0:
         start_time = time.time()
-    
+
     while step < total_steps_for_era:
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             step += 1
@@ -311,7 +292,7 @@ for era in range(1 if args.adam or args.no_warmup else 0, args.eras + 1):
 
             step_time = (time.time() - start_time) / (args.steps * (era - 1 if era > 0 else 0) + step + (5 * len(train_loader) if not args.adam and era > 0 else 0))
             remaining_time = (total_steps_for_era - step + (args.eras - era) * args.steps) * step_time
-            
+
         score, score_ema = test()
         if 100 * score > peak:
             peak = 100 * score
